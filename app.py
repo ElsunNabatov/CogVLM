@@ -1,3 +1,4 @@
+# app.py
 import io
 import os
 from typing import Optional, List, Tuple
@@ -5,108 +6,204 @@ from typing import Optional, List, Tuple
 import streamlit as st
 from PIL import Image
 import torch
+from packaging import version
+
+# Transformers sanity check (prevents "AutoModelForCausalLM not found" issues)
+import transformers as tf
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+MIN_TF = "4.41.0"
+if version.parse(tf.__version__) < version.parse(MIN_TF):
+    raise RuntimeError(
+        f"transformers>={MIN_TF} required, found {tf.__version__}. "
+        "Update requirements.txt and reinstall."
+    )
+
 # -------------------------
-# Helpers
+# Config
 # -------------------------
-def load_model(model_id: str, quant4: bool, dtype_choice: str, device_map: str):
-    kwargs = dict(trust_remote_code=True)
-    # dtype
-    if dtype_choice == "bfloat16":
-        kwargs["torch_dtype"] = torch.bfloat16
-    elif dtype_choice == "float16":
-        kwargs["torch_dtype"] = torch.float16
+DEFAULT_MODEL = "THUDM/cogagent-chat-hf"    # great for GUI/grounding + multi-turn
+ALT_MODEL     = "THUDM/cogvlm-chat-hf"      # general visual chat/VQA
+# For complete reproducibility, replace "main" with a known commit hash from the model card
+REVISION_PIN  = "main"
+
+st.set_page_config(page_title="CogVLM / CogAgent • Streamlit", page_icon="🖼️", layout="wide")
+st.title("🖼️ CogVLM / CogAgent — Streamlit")
+
+# -------------------------
+# Utilities
+# -------------------------
+def pick_default_device() -> str:
+    """Prefer CUDA, else CPU."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps"  # Apple Silicon fallback (no 4-bit)
+    return "cpu"
+
+def dtype_from_choice(choice: str):
+    if choice == "bfloat16":
+        return torch.bfloat16
+    if choice == "float16":
+        return torch.float16
+    return None  # float32
+
+def load_model(model_id: str, device: str, dtype_choice: str, use_4bit: bool):
+    """Load HF ports of CogAgent/CogVLM with safe defaults for CPU and GPU."""
+    kwargs = dict(
+        trust_remote_code=True,
+        revision=REVISION_PIN,
+    )
+
+    # dtype handling
+    torch_dtype = dtype_from_choice(dtype_choice)
+    # Force float32 on pure CPU to avoid slowdowns / unsupported ops
+    if device == "cpu":
+        torch_dtype = None
 
     # device map
-    kwargs["device_map"] = device_map  # "auto" (GPU) or "cpu"
+    if device == "cuda":
+        kwargs["device_map"] = "auto"
+        if use_4bit:
+            # requires bitsandbytes + CUDA
+            kwargs.update(
+                dict(
+                    load_in_4bit=True,
+                    bnb_4bit_compute_dtype=torch.bfloat16 if dtype_choice == "bfloat16" else torch.float16,
+                )
+            )
+        else:
+            kwargs["torch_dtype"] = torch_dtype or torch.bfloat16
+    elif device == "mps":
+        kwargs["device_map"] = {"": "mps"}
+        kwargs["torch_dtype"] = torch_dtype or torch.float16
+    else:
+        kwargs["device_map"] = "cpu"
+        # leave torch_dtype None on CPU
 
-    # 4-bit quant (optional; needs bitsandbytes + GPU)
-    if quant4:
-        kwargs.update(dict(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16 if dtype_choice == "bfloat16" else torch.float16,
-        ))
-
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, revision=REVISION_PIN)
     model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
     model.eval()
     return model, tokenizer
 
-def run_chat(model, tokenizer, image: Optional[Image.Image], question: str, history: Optional[List[Tuple[str, str]]]):
+@torch.inference_mode()
+def run_chat(model, tokenizer, image: Optional[Image.Image], question: str,
+             history: Optional[List[Tuple[str, str]]],
+             max_new_tokens: int = 512, temperature: float = 0.2, top_p: float = 0.95):
     """
-    Uses the model's custom .chat() (provided via trust_remote_code)
-    history format: list of (user, assistant) turns
+    Preferred path: Cog* HF ports expose model.chat(tokenizer, image, question, history=...).
+    Fallback path: build a chat template manually.
+    Returns: reply text
     """
-    # Some HF ports of CogVLM/CogAgent ship a .chat util
-    # Fallback: build a chat template if .chat doesn't exist
     if hasattr(model, "chat"):
+        # Most CogAgent/CogVLM HF ports provide this
         return model.chat(tokenizer, image, question, history=history)
-    else:
-        # Generic fallback using chat template
-        msgs = []
-        if history:
-            for u, a in history:
-                msgs.append({"role": "user", "content": u})
-                msgs.append({"role": "assistant", "content": a})
-        if image is not None:
-            # The Cog* models expect an image tensor internally when using .chat;
-            # without .chat we rely on their chat template with image token.
-            # Most Cog* ports expose .chat, so this path is rarely used.
-            question = f"<image>\n{question}"
-        text = tokenizer.apply_chat_template(msgs + [{"role": "user", "content": question}],
-                                             tokenize=False, add_generation_prompt=True)
-        inputs = tokenizer(text, return_tensors="pt").to(model.device)
-        out = model.generate(**inputs, max_new_tokens=512, do_sample=True, temperature=0.2)
-        resp = tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-        return resp, history
+
+    # Fallback: generic chat template
+    msgs = []
+    if history:
+        for u, a in history:
+            msgs.append({"role": "user", "content": u})
+            msgs.append({"role": "assistant", "content": a})
+
+    content = question
+    if image is not None:
+        # Many Cog* templates use a special <image> tag when not using .chat()
+        content = f"<image>\n{question}"
+
+    msgs.append({"role": "user", "content": content})
+    prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(prompt, return_tensors="pt")
+    # Move to model device
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+    gen_out = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=True,
+        temperature=temperature,
+        top_p=top_p,
+        pad_token_id=tokenizer.eos_token_id,
+    )
+    reply = tokenizer.decode(gen_out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+    return reply
+
+def cuda_available() -> bool:
+    return torch.cuda.is_available()
+
+def mps_available() -> bool:
+    return getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
 
 # -------------------------
-# UI
+# Sidebar (runtime controls)
 # -------------------------
-st.set_page_config(page_title="CogVLM / CogAgent • Streamlit", page_icon="🖼️", layout="wide")
-st.title("🖼️ CogVLM / CogAgent — Streamlit")
-
 with st.sidebar:
     st.subheader("Model & Runtime")
     model_id = st.selectbox(
         "Model",
-        [
-            "THUDM/cogagent-chat-hf",     # GUI/grounding/multi-turn
-            "THUDM/cogvlm-chat-hf",       # general chat + VQA
-        ],
-        help="Pick CogAgent for GUI/grounding-heavy tasks; CogVLM for general visual chat."
+        [DEFAULT_MODEL, ALT_MODEL],
+        help="CogAgent (GUI/grounding, higher-res). CogVLM (general visual chat/VQA)."
     )
-    device_pref = st.selectbox("Device", ["auto (GPU if available)", "cpu"])
-    dtype_choice = st.selectbox("Torch dtype", ["bfloat16", "float16", "float32"], index=0)
-    quant4 = st.checkbox("Load in 4-bit (bitsandbytes)", value=False,
-                         help="Saves VRAM; needs a CUDA GPU and bitsandbytes.")
+
+    device_default = pick_default_device()
+    device = st.selectbox(
+        "Device",
+        ["cpu", "cuda" if cuda_available() else "cuda (unavailable)", "mps" if mps_available() else "mps (unavailable)"],
+        index=0 if device_default == "cpu" else (1 if device_default == "cuda" else 2),
+        help="CPU works everywhere. CUDA uses NVIDIA GPUs. MPS uses Apple Silicon."
+    )
+    # sanitize selection
+    if "unavailable" in device:
+        device = "cpu"
+
+    # dtype choices (float32 recommended on CPU)
+    dtype_options = ["float32", "bfloat16", "float16"]
+    dtype_index = 0 if device == "cpu" else 1  # default bfloat16 on GPU
+    dtype_choice = st.selectbox("Torch dtype", dtype_options, index=dtype_index)
+
+    # 4-bit only when CUDA is available
+    use_4bit = False
+    if device == "cuda":
+        use_4bit = st.checkbox("Load in 4-bit (bitsandbytes)", value=False,
+                               help="Saves VRAM. Requires CUDA + bitsandbytes.")
+
+    st.divider()
+    st.subheader("Generation")
+    max_new_tokens = st.slider("Max new tokens", 64, 2048, 512, step=64)
+    temperature = st.slider("Temperature", 0.0, 1.5, 0.2, step=0.05)
+    top_p = st.slider("Top-p", 0.1, 1.0, 0.95, step=0.05)
+
+    st.divider()
     load_btn = st.button("Load / Reload model", type="primary")
 
-    st.caption("Tip: CogAgent supports higher-res inputs and GUI tasks; CogVLM is great for general image QA. "
-               "Both expose a convenient `.chat()` in the HF ports.")
-
+# -------------------------
 # Session state
+# -------------------------
 if "model" not in st.session_state:
     st.session_state.model = None
     st.session_state.tokenizer = None
     st.session_state.history = []  # list[(user, assistant)]
     st.session_state.model_id = None
 
-# Load model
-if load_btn or (st.session_state.model is None):
-    with st.spinner(f"Loading {model_id}…"):
+# -------------------------
+# Model loading
+# -------------------------
+if load_btn or st.session_state.model is None or st.session_state.model_id != model_id:
+    with st.spinner(f"Loading {model_id} on {device}…"):
         try:
-            device_map = "auto" if device_pref.startswith("auto") else "cpu"
-            model, tok = load_model(model_id, quant4=quant4, dtype_choice=dtype_choice, device_map=device_map)
+            model, tok = load_model(model_id, device=device, dtype_choice=dtype_choice, use_4bit=use_4bit)
             st.session_state.model = model
             st.session_state.tokenizer = tok
             st.session_state.model_id = model_id
-            st.success(f"Loaded {model_id}")
+            st.success(f"Loaded {model_id} ({device})")
         except Exception as e:
+            st.session_state.model = None
+            st.session_state.tokenizer = None
             st.error(f"Error loading model: {e}")
 
-# Chat area
+# -------------------------
+# UI: left image, right chat
+# -------------------------
 col_left, col_right = st.columns([1, 1])
 
 with col_left:
@@ -120,24 +217,30 @@ with col_left:
 
 with col_right:
     st.subheader("Chat")
-    # Show prior turns
+    # History preview
     if st.session_state.history:
         for u, a in st.session_state.history:
             st.markdown(f"**You:** {u}")
             st.markdown(f"**Model:** {a}")
 
-    user_q = st.text_area("Your question / instruction", value="", height=100,
-                          placeholder='e.g., "Describe this screenshot and find the login button."')
+    user_q = st.text_area(
+        "Your question / instruction",
+        value="",
+        height=100,
+        placeholder='e.g., "Describe this screenshot and find the login button."'
+    )
 
-    col_a, col_b = st.columns([1, 1])
-    with col_a:
-        clear_btn = st.button("Clear conversation", use_container_width=True)
-    with col_b:
+    c1, c2, c3 = st.columns([1, 1, 1])
+    with c1:
+        clear_btn = st.button("Clear", use_container_width=True)
+    with c2:
         ask_btn = st.button("Ask", type="primary", use_container_width=True)
+    with c3:
+        stop_placeholder = st.empty()  # reserved for future streaming UI
 
     if clear_btn:
         st.session_state.history = []
-        st.experimental_rerun()
+        st.rerun()
 
     if ask_btn:
         if st.session_state.model is None:
@@ -147,8 +250,22 @@ with col_right:
         else:
             with st.spinner("Thinking…"):
                 try:
-                    reply, _ = run_chat(st.session_state.model, st.session_state.tokenizer, image, user_q, st.session_state.history)
-                    st.session_state.history.append((user_q, reply))
-                    st.experimental_rerun()
+                    reply = run_chat(
+                        st.session_state.model,
+                        st.session_state.tokenizer,
+                        image,
+                        user_q.strip(),
+                        st.session_state.history,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                    )
+                    # Some Cog* return (reply, history). Normalize both cases.
+                    if isinstance(reply, tuple) and len(reply) == 2:
+                        reply_text, _ = reply
+                    else:
+                        reply_text = reply
+                    st.session_state.history.append((user_q.strip(), reply_text))
+                    st.rerun()
                 except Exception as e:
-                    st.error(f"Error during inference: {e}")
+                    st.error(f"Inference error: {e}")
