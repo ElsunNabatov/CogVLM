@@ -1,6 +1,5 @@
 # app.py
 import io
-import os
 from typing import Optional, List, Tuple
 
 import streamlit as st
@@ -10,7 +9,7 @@ from packaging import version
 
 # Transformers sanity check (prevents "AutoModelForCausalLM not found" issues)
 import transformers as tf
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer
 
 MIN_TF = "4.41.0"
 if version.parse(tf.__version__) < version.parse(MIN_TF):
@@ -24,7 +23,7 @@ if version.parse(tf.__version__) < version.parse(MIN_TF):
 # -------------------------
 DEFAULT_MODEL = "THUDM/cogagent-chat-hf"    # great for GUI/grounding + multi-turn
 ALT_MODEL     = "THUDM/cogvlm-chat-hf"      # general visual chat/VQA
-# For complete reproducibility, replace "main" with a known commit hash from the model card
+# For reproducibility, you can replace "main" with a specific commit hash from the model card
 REVISION_PIN  = "main"
 
 st.set_page_config(page_title="CogVLM / CogAgent • Streamlit", page_icon="🖼️", layout="wide")
@@ -34,7 +33,7 @@ st.title("🖼️ CogVLM / CogAgent — Streamlit")
 # Utilities
 # -------------------------
 def pick_default_device() -> str:
-    """Prefer CUDA, else CPU."""
+    """Prefer CUDA, else MPS, else CPU."""
     if torch.cuda.is_available():
         return "cuda"
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
@@ -47,6 +46,10 @@ def dtype_from_choice(choice: str):
     if choice == "float16":
         return torch.float16
     return None  # float32
+
+def is_cog_family(model_id: str) -> bool:
+    mid = model_id.lower()
+    return ("cogvlm" in mid) or ("cogagent" in mid)
 
 def load_model(model_id: str, device: str, dtype_choice: str, use_4bit: bool):
     """Load HF ports of CogAgent/CogVLM with safe defaults for CPU and GPU."""
@@ -81,7 +84,18 @@ def load_model(model_id: str, device: str, dtype_choice: str, use_4bit: bool):
         kwargs["device_map"] = "cpu"
         # leave torch_dtype None on CPU
 
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, revision=REVISION_PIN)
+    # ---------- Tokenizer ----------
+    if is_cog_family(model_id):
+        # Use Vicuna's Llama tokenizer for CogVLM/CogAgent v1 checkpoints
+        tokenizer = LlamaTokenizer.from_pretrained("lmsys/vicuna-7b-v1.5", use_fast=False)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, revision=REVISION_PIN)
+
+    # pad token fix (Vicuna/Llama often lack pad); align pad with eos to avoid warnings
+    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    # ---------- Model ----------
     model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
     model.eval()
     return model, tokenizer
@@ -123,7 +137,7 @@ def run_chat(model, tokenizer, image: Optional[Image.Image], question: str,
         do_sample=True,
         temperature=temperature,
         top_p=top_p,
-        pad_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
     )
     reply = tokenizer.decode(gen_out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
     return reply
@@ -146,15 +160,17 @@ with st.sidebar:
     )
 
     device_default = pick_default_device()
+    device_options = ["cpu"]
+    if cuda_available():
+        device_options.append("cuda")
+    if mps_available():
+        device_options.append("mps")
+
     device = st.selectbox(
-        "Device",
-        ["cpu", "cuda" if cuda_available() else "cuda (unavailable)", "mps" if mps_available() else "mps (unavailable)"],
-        index=0 if device_default == "cpu" else (1 if device_default == "cuda" else 2),
+        "Device", device_options,
+        index=device_options.index(device_default) if device_default in device_options else 0,
         help="CPU works everywhere. CUDA uses NVIDIA GPUs. MPS uses Apple Silicon."
     )
-    # sanitize selection
-    if "unavailable" in device:
-        device = "cpu"
 
     # dtype choices (float32 recommended on CPU)
     dtype_options = ["float32", "bfloat16", "float16"]
@@ -188,7 +204,13 @@ if "model" not in st.session_state:
 # -------------------------
 # Model loading
 # -------------------------
-if load_btn or st.session_state.model is None or st.session_state.model_id != model_id:
+def need_load() -> bool:
+    return (
+        st.session_state.model is None
+        or st.session_state.model_id != model_id
+    )
+
+if load_btn or need_load():
     with st.spinner(f"Loading {model_id} on {device}…"):
         try:
             model, tok = load_model(model_id, device=device, dtype_choice=dtype_choice, use_4bit=use_4bit)
@@ -230,13 +252,11 @@ with col_right:
         placeholder='e.g., "Describe this screenshot and find the login button."'
     )
 
-    c1, c2, c3 = st.columns([1, 1, 1])
+    c1, c2, _ = st.columns([1, 1, 1])
     with c1:
         clear_btn = st.button("Clear", use_container_width=True)
     with c2:
         ask_btn = st.button("Ask", type="primary", use_container_width=True)
-    with c3:
-        stop_placeholder = st.empty()  # reserved for future streaming UI
 
     if clear_btn:
         st.session_state.history = []
