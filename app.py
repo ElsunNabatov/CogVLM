@@ -1,4 +1,4 @@
-# app.py
+# app.py — CPU-only Streamlit app for visual chat (Streamlit Cloud friendly)
 import io
 from typing import Optional, List, Tuple
 
@@ -7,225 +7,172 @@ from PIL import Image
 import torch
 from packaging import version
 
-# Transformers sanity check (prevents "AutoModelForCausalLM not found" issues)
+# ---- Transformers version check (prevents older-API issues) ----
 import transformers as tf
-from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaTokenizer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    AutoProcessor,   # for multimodal inputs (text+image)
+)
 
 MIN_TF = "4.41.0"
 if version.parse(tf.__version__) < version.parse(MIN_TF):
     raise RuntimeError(
         f"transformers>={MIN_TF} required, found {tf.__version__}. "
-        "Update requirements.txt and reinstall."
+        "Update requirements.txt and redeploy."
     )
 
 # -------------------------
-# Config
+# Config (CPU-friendly)
 # -------------------------
-DEFAULT_MODEL = "THUDM/cogagent-chat-hf"    # great for GUI/grounding + multi-turn
-ALT_MODEL     = "THUDM/cogvlm-chat-hf"      # general visual chat/VQA
-# For reproducibility, you can replace "main" with a specific commit hash from the model card
-REVISION_PIN  = "main"
+MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"   # small enough for CPU
+REVISION_PIN = "main"                    # replace with a commit hash if you want strict reproducibility
 
-st.set_page_config(page_title="CogVLM / CogAgent • Streamlit", page_icon="🖼️", layout="wide")
-st.title("🖼️ CogVLM / CogAgent — Streamlit")
+st.set_page_config(page_title="Image Chat (CPU) — Streamlit", page_icon="🖼️", layout="wide")
+st.title("🖼️ Visual Chat — CPU-Only (Streamlit Cloud)")
 
 # -------------------------
-# Utilities
+# Loading helpers (CPU only)
 # -------------------------
-def pick_default_device() -> str:
-    """Prefer CUDA, else MPS, else CPU."""
-    if torch.cuda.is_available():
-        return "cuda"
-    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-        return "mps"  # Apple Silicon fallback (no 4-bit)
-    return "cpu"
-
-def dtype_from_choice(choice: str):
-    if choice == "bfloat16":
-        return torch.bfloat16
-    if choice == "float16":
-        return torch.float16
-    return None  # float32
-
-def is_cog_family(model_id: str) -> bool:
-    mid = model_id.lower()
-    return ("cogvlm" in mid) or ("cogagent" in mid)
-
-def load_model(model_id: str, device: str, dtype_choice: str, use_4bit: bool):
-    """Load HF ports of CogAgent/CogVLM with safe defaults for CPU and GPU."""
+def load_cpu_model(model_id: str):
+    """
+    Load a small multimodal chat model on CPU with safe, low-memory settings.
+    """
     kwargs = dict(
         trust_remote_code=True,
         revision=REVISION_PIN,
+        device_map="cpu",
+        low_cpu_mem_usage=True,
+        offload_folder="/tmp/hf_offload",   # reduce RAM spikes when assembling weights
+        torch_dtype=None,                   # float32 on CPU
     )
 
-    # dtype handling
-    torch_dtype = dtype_from_choice(dtype_choice)
-    # Force float32 on pure CPU to avoid slowdowns / unsupported ops
-    if device == "cpu":
-        torch_dtype = None
-
-    # device map
-    if device == "cuda":
-        kwargs["device_map"] = "auto"
-        if use_4bit:
-            # requires bitsandbytes + CUDA
-            kwargs.update(
-                dict(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=torch.bfloat16 if dtype_choice == "bfloat16" else torch.float16,
-                )
-            )
-        else:
-            kwargs["torch_dtype"] = torch_dtype or torch.bfloat16
-    elif device == "mps":
-        kwargs["device_map"] = {"": "mps"}
-        kwargs["torch_dtype"] = torch_dtype or torch.float16
-    else:
-        kwargs["device_map"] = "cpu"
-        # leave torch_dtype None on CPU
-
-    # ---------- Tokenizer ----------
-    if is_cog_family(model_id):
-        # Use Vicuna's Llama tokenizer for CogVLM/CogAgent v1 checkpoints
-        tokenizer = LlamaTokenizer.from_pretrained("lmsys/vicuna-7b-v1.5", use_fast=False)
-    else:
-        tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, revision=REVISION_PIN)
-
-    # pad token fix (Vicuna/Llama often lack pad); align pad with eos to avoid warnings
-    if tokenizer.pad_token is None and tokenizer.eos_token is not None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    # ---------- Model ----------
+    # Qwen2-VL ships tokenizer + processor
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, revision=REVISION_PIN)
+    processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True, revision=REVISION_PIN)
     model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
     model.eval()
-    return model, tokenizer
+    return model, tokenizer, processor
 
 @torch.inference_mode()
-def run_chat(model, tokenizer, image: Optional[Image.Image], question: str,
-             history: Optional[List[Tuple[str, str]]],
-             max_new_tokens: int = 512, temperature: float = 0.2, top_p: float = 0.95):
+def chat_once(
+    model,
+    tokenizer,
+    processor,
+    image: Optional[Image.Image],
+    question: str,
+    history_pairs: Optional[List[Tuple[str, str]]] = None,
+    max_new_tokens: int = 512,
+    temperature: float = 0.2,
+    top_p: float = 0.95,
+) -> str:
     """
-    Preferred path: Cog* HF ports expose model.chat(tokenizer, image, question, history=...).
-    Fallback path: build a chat template manually.
-    Returns: reply text
+    Try model-provided .chat first (many VLMs implement it with trust_remote_code).
+    Fall back to building messages for transformers>=4.41 multimodal chat.
     """
-    if hasattr(model, "chat"):
-        # Most CogAgent/CogVLM HF ports provide this
-        return model.chat(tokenizer, image, question, history=history)
 
-    # Fallback: generic chat template
-    msgs = []
-    if history:
-        for u, a in history:
-            msgs.append({"role": "user", "content": u})
-            msgs.append({"role": "assistant", "content": a})
+    # Build history as "messages" (role/content) for fallback & for some .chat impls
+    messages = []
+    if history_pairs:
+        for u, a in history_pairs:
+            messages.append({"role": "user", "content": [{"type": "text", "text": u}]})
+            messages.append({"role": "assistant", "content": [{"type": "text", "text": a}]})
 
-    content = question
+    user_content = []
     if image is not None:
-        # Many Cog* templates use a special <image> tag when not using .chat()
-        content = f"<image>\n{question}"
+        user_content.append({"type": "image", "image": image})
+    user_content.append({"type": "text", "text": question})
+    messages.append({"role": "user", "content": user_content})
 
-    msgs.append({"role": "user", "content": content})
-    prompt = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(prompt, return_tensors="pt")
-    # Move to model device
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    # 1) Try model.chat with processor (most Qwen2-VL builds accept this)
+    if hasattr(model, "chat"):
+        try:
+            return model.chat(processor, image, question, history=history_pairs)
+        except Exception:
+            # 2) Try with tokenizer (some models want tokenizer)
+            try:
+                return model.chat(tokenizer, image, question, history=history_pairs)
+            except Exception:
+                pass  # fall back below
 
-    gen_out = model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=True,
-        temperature=temperature,
-        top_p=top_p,
-        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-    )
-    reply = tokenizer.decode(gen_out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
-    return reply
+    # 3) Fallback: prepare inputs via processor with chat template
+    # Newer transformers let AutoProcessor handle the multimodal message list directly.
+    try:
+        inputs = processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_tensors="pt",
+        )
+        # Images: pass separately through processor if needed
+        # If an image is present, pack it into "images" kwarg
+        gen_kwargs = dict(
+            max_new_tokens=max_new_tokens,
+            do_sample=True,
+            temperature=temperature,
+            top_p=top_p,
+            pad_token_id=tokenizer.eos_token_id if tokenizer.eos_token_id is not None else None,
+        )
 
-def cuda_available() -> bool:
-    return torch.cuda.is_available()
+        if image is not None:
+            # Some processors expect images via __call__(...) not via apply_chat_template only.
+            # Re-run to ensure pixel values are included:
+            inputs = processor(
+                messages=messages,
+                add_generation_prompt=True,
+                return_tensors="pt",
+            )
 
-def mps_available() -> bool:
-    return getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
+        inputs = {k: v.to(model.device) if hasattr(v, "to") else v for k, v in inputs.items()}
+        output_ids = model.generate(**inputs, **gen_kwargs)
+        # For chat templates, new tokens start after input length
+        in_len = inputs["input_ids"].shape[1]
+        text = tokenizer.decode(output_ids[0][in_len:], skip_special_tokens=True)
+        return text
+    except Exception as e:
+        return f"(Error during generation: {e})"
 
 # -------------------------
-# Sidebar (runtime controls)
+# UI — image on the left, chat on the right
 # -------------------------
 with st.sidebar:
-    st.subheader("Model & Runtime")
-    model_id = st.selectbox(
-        "Model",
-        [DEFAULT_MODEL, ALT_MODEL],
-        help="CogAgent (GUI/grounding, higher-res). CogVLM (general visual chat/VQA)."
-    )
+    st.subheader("Model (CPU)")
+    st.caption("Designed for Streamlit Cloud (no GPU). If you later move to a GPU box, you can switch to larger models.")
+    st.text(MODEL_ID)
 
-    device_default = pick_default_device()
-    device_options = ["cpu"]
-    if cuda_available():
-        device_options.append("cuda")
-    if mps_available():
-        device_options.append("mps")
-
-    device = st.selectbox(
-        "Device", device_options,
-        index=device_options.index(device_default) if device_default in device_options else 0,
-        help="CPU works everywhere. CUDA uses NVIDIA GPUs. MPS uses Apple Silicon."
-    )
-
-    # dtype choices (float32 recommended on CPU)
-    dtype_options = ["float32", "bfloat16", "float16"]
-    dtype_index = 0 if device == "cpu" else 1  # default bfloat16 on GPU
-    dtype_choice = st.selectbox("Torch dtype", dtype_options, index=dtype_index)
-
-    # 4-bit only when CUDA is available
-    use_4bit = False
-    if device == "cuda":
-        use_4bit = st.checkbox("Load in 4-bit (bitsandbytes)", value=False,
-                               help="Saves VRAM. Requires CUDA + bitsandbytes.")
-
-    st.divider()
     st.subheader("Generation")
-    max_new_tokens = st.slider("Max new tokens", 64, 2048, 512, step=64)
+    max_new_tokens = st.slider("Max new tokens", 64, 1024, 384, step=32)
     temperature = st.slider("Temperature", 0.0, 1.5, 0.2, step=0.05)
     top_p = st.slider("Top-p", 0.1, 1.0, 0.95, step=0.05)
 
-    st.divider()
     load_btn = st.button("Load / Reload model", type="primary")
 
-# -------------------------
 # Session state
-# -------------------------
 if "model" not in st.session_state:
     st.session_state.model = None
     st.session_state.tokenizer = None
-    st.session_state.history = []  # list[(user, assistant)]
-    st.session_state.model_id = None
+    st.session_state.processor = None
+    st.session_state.history = []  # list of (user, assistant)
 
-# -------------------------
-# Model loading
-# -------------------------
-def need_load() -> bool:
-    return (
-        st.session_state.model is None
-        or st.session_state.model_id != model_id
-    )
+# Load model (CPU only)
+def needs_load():
+    return st.session_state.model is None
 
-if load_btn or need_load():
-    with st.spinner(f"Loading {model_id} on {device}…"):
+if load_btn or needs_load():
+    with st.spinner(f"Loading {MODEL_ID} on CPU…"):
         try:
-            model, tok = load_model(model_id, device=device, dtype_choice=dtype_choice, use_4bit=use_4bit)
+            model, tok, proc = load_cpu_model(MODEL_ID)
             st.session_state.model = model
             st.session_state.tokenizer = tok
-            st.session_state.model_id = model_id
-            st.success(f"Loaded {model_id} ({device})")
+            st.session_state.processor = proc
+            st.success(f"Loaded {MODEL_ID} (CPU)")
         except Exception as e:
             st.session_state.model = None
             st.session_state.tokenizer = None
+            st.session_state.processor = None
             st.error(f"Error loading model: {e}")
 
-# -------------------------
-# UI: left image, right chat
-# -------------------------
+# Main layout
 col_left, col_right = st.columns([1, 1])
 
 with col_left:
@@ -233,13 +180,12 @@ with col_left:
     uploaded = st.file_uploader("Upload an image", type=["png", "jpg", "jpeg", "webp"])
     image = None
     if uploaded:
-        bytes_data = uploaded.read()
-        image = Image.open(io.BytesIO(bytes_data)).convert("RGB")
+        image = Image.open(io.BytesIO(uploaded.read())).convert("RGB")
         st.image(image, caption="Input image", use_container_width=True)
 
 with col_right:
     st.subheader("Chat")
-    # History preview
+    # show history
     if st.session_state.history:
         for u, a in st.session_state.history:
             st.markdown(f"**You:** {u}")
@@ -249,12 +195,12 @@ with col_right:
         "Your question / instruction",
         value="",
         height=100,
-        placeholder='e.g., "Describe this screenshot and find the login button."'
+        placeholder='e.g., "Describe this screenshot and locate the login button."'
     )
 
-    c1, c2, _ = st.columns([1, 1, 1])
+    c1, c2 = st.columns([1, 1])
     with c1:
-        clear_btn = st.button("Clear", use_container_width=True)
+        clear_btn = st.button("Clear history", use_container_width=True)
     with c2:
         ask_btn = st.button("Ask", type="primary", use_container_width=True)
 
@@ -264,28 +210,21 @@ with col_right:
 
     if ask_btn:
         if st.session_state.model is None:
-            st.warning("Load a model first from the sidebar.")
+            st.warning("Click “Load / Reload model” in the sidebar first.")
         elif not user_q.strip():
             st.warning("Type a question.")
         else:
             with st.spinner("Thinking…"):
-                try:
-                    reply = run_chat(
-                        st.session_state.model,
-                        st.session_state.tokenizer,
-                        image,
-                        user_q.strip(),
-                        st.session_state.history,
-                        max_new_tokens=max_new_tokens,
-                        temperature=temperature,
-                        top_p=top_p,
-                    )
-                    # Some Cog* return (reply, history). Normalize both cases.
-                    if isinstance(reply, tuple) and len(reply) == 2:
-                        reply_text, _ = reply
-                    else:
-                        reply_text = reply
-                    st.session_state.history.append((user_q.strip(), reply_text))
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Inference error: {e}")
+                reply = chat_once(
+                    model=st.session_state.model,
+                    tokenizer=st.session_state.tokenizer,
+                    processor=st.session_state.processor,
+                    image=image,
+                    question=user_q.strip(),
+                    history_pairs=st.session_state.history,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                )
+                st.session_state.history.append((user_q.strip(), reply))
+                st.rerun()
