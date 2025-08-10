@@ -7,15 +7,12 @@ from PIL import Image
 import torch
 from packaging import version
 
-# ---- Transformers version check (prevents older-API issues) ----
+# ---- Transformers version check ----
 import transformers as tf
-from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    AutoProcessor,   # for multimodal inputs (text+image)
-)
+from transformers import AutoProcessor
+from transformers import Qwen2VLForConditionalGeneration  # <-- correct class for Qwen2-VL
 
-MIN_TF = "4.41.0"
+MIN_TF = "4.41.0"  # Qwen2-VL works best on >=4.43, but 4.41+ is acceptable with AutoProcessor.
 if version.parse(tf.__version__) < version.parse(MIN_TF):
     raise RuntimeError(
         f"transformers>={MIN_TF} required, found {tf.__version__}. "
@@ -26,7 +23,7 @@ if version.parse(tf.__version__) < version.parse(MIN_TF):
 # Config (CPU-friendly)
 # -------------------------
 MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"   # small enough for CPU
-REVISION_PIN = "main"                    # replace with a commit hash if you want strict reproducibility
+REVISION_PIN = "main"                    # replace with a commit hash for strict reproducibility
 
 st.set_page_config(page_title="Image Chat (CPU) — Streamlit", page_icon="🖼️", layout="wide")
 st.title("🖼️ Visual Chat — CPU-Only (Streamlit Cloud)")
@@ -44,21 +41,18 @@ def load_cpu_model(model_id: str):
         device_map="cpu",
         low_cpu_mem_usage=True,
         offload_folder="/tmp/hf_offload",   # reduce RAM spikes when assembling weights
-        torch_dtype=None,                   # float32 on CPU
+        torch_dtype=torch.float32,          # explicit float32 on CPU
     )
 
-    # Qwen2-VL ships tokenizer + processor
-    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True, revision=REVISION_PIN)
     processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True, revision=REVISION_PIN)
-    model = AutoModelForCausalLM.from_pretrained(model_id, **kwargs)
+    model = Qwen2VLForConditionalGeneration.from_pretrained(model_id, **kwargs)
     model.eval()
-    return model, tokenizer, processor
+    return model, processor
 
 @torch.inference_mode()
 def chat_once(
-    model,
-    tokenizer,
-    processor,
+    model: Qwen2VLForConditionalGeneration,
+    processor: AutoProcessor,
     image: Optional[Image.Image],
     question: str,
     history_pairs: Optional[List[Tuple[str, str]]] = None,
@@ -67,11 +61,11 @@ def chat_once(
     top_p: float = 0.95,
 ) -> str:
     """
-    Try model-provided .chat first (many VLMs implement it with trust_remote_code).
-    Fall back to building messages for transformers>=4.41 multimodal chat.
+    Qwen2-VL flow (CPU):
+    - Build messages as a list of dicts with text+image entries
+    - Let AutoProcessor pack everything into tensors
+    - Generate & decode
     """
-
-    # Build history as "messages" (role/content) for fallback & for some .chat impls
     messages = []
     if history_pairs:
         for u, a in history_pairs:
@@ -84,60 +78,41 @@ def chat_once(
     user_content.append({"type": "text", "text": question})
     messages.append({"role": "user", "content": user_content})
 
-    # 1) Try model.chat with processor (most Qwen2-VL builds accept this)
-    if hasattr(model, "chat"):
-        try:
-            return model.chat(processor, image, question, history=history_pairs)
-        except Exception:
-            # 2) Try with tokenizer (some models want tokenizer)
-            try:
-                return model.chat(tokenizer, image, question, history=history_pairs)
-            except Exception:
-                pass  # fall back below
+    # Prepare inputs (includes pixel values if image present)
+    inputs = processor(
+        messages=messages,
+        add_generation_prompt=True,
+        return_tensors="pt",
+    )
 
-    # 3) Fallback: prepare inputs via processor with chat template
-    # Newer transformers let AutoProcessor handle the multimodal message list directly.
-    try:
-        inputs = processor.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_tensors="pt",
-        )
-        # Images: pass separately through processor if needed
-        # If an image is present, pack it into "images" kwarg
-        gen_kwargs = dict(
-            max_new_tokens=max_new_tokens,
-            do_sample=True,
-            temperature=temperature,
-            top_p=top_p,
-            pad_token_id=tokenizer.eos_token_id if tokenizer.eos_token_id is not None else None,
-        )
+    # Move to CPU device explicitly (Streamlit Cloud is CPU)
+    inputs = {k: v.to("cpu") if hasattr(v, "to") else v for k, v in inputs.items()}
 
-        if image is not None:
-            # Some processors expect images via __call__(...) not via apply_chat_template only.
-            # Re-run to ensure pixel values are included:
-            inputs = processor(
-                messages=messages,
-                add_generation_prompt=True,
-                return_tensors="pt",
-            )
+    gen_kwargs = dict(
+        max_new_tokens=max_new_tokens,
+        do_sample=True,
+        temperature=temperature,
+        top_p=top_p,
+        pad_token_id=model.config.eos_token_id,
+    )
 
-        inputs = {k: v.to(model.device) if hasattr(v, "to") else v for k, v in inputs.items()}
-        output_ids = model.generate(**inputs, **gen_kwargs)
-        # For chat templates, new tokens start after input length
-        in_len = inputs["input_ids"].shape[1]
-        text = tokenizer.decode(output_ids[0][in_len:], skip_special_tokens=True)
-        return text
-    except Exception as e:
-        return f"(Error during generation: {e})"
+    output_ids = model.generate(**inputs, **gen_kwargs)
+
+    # New tokens start after input length
+    input_len = inputs["input_ids"].shape[1]
+    new_tokens = output_ids[0][input_len:]
+
+    # Decode with the processor's tokenizer
+    tokenizer = processor.tokenizer
+    text = tokenizer.decode(new_tokens, skip_special_tokens=True)
+    return text.strip()
 
 # -------------------------
 # UI — image on the left, chat on the right
 # -------------------------
 with st.sidebar:
     st.subheader("Model (CPU)")
-    st.caption("Designed for Streamlit Cloud (no GPU). If you later move to a GPU box, you can switch to larger models.")
+    st.caption("Designed for Streamlit Cloud (no GPU).")
     st.text(MODEL_ID)
 
     st.subheader("Generation")
@@ -150,7 +125,6 @@ with st.sidebar:
 # Session state
 if "model" not in st.session_state:
     st.session_state.model = None
-    st.session_state.tokenizer = None
     st.session_state.processor = None
     st.session_state.history = []  # list of (user, assistant)
 
@@ -161,14 +135,12 @@ def needs_load():
 if load_btn or needs_load():
     with st.spinner(f"Loading {MODEL_ID} on CPU…"):
         try:
-            model, tok, proc = load_cpu_model(MODEL_ID)
+            model, proc = load_cpu_model(MODEL_ID)
             st.session_state.model = model
-            st.session_state.tokenizer = tok
             st.session_state.processor = proc
             st.success(f"Loaded {MODEL_ID} (CPU)")
         except Exception as e:
             st.session_state.model = None
-            st.session_state.tokenizer = None
             st.session_state.processor = None
             st.error(f"Error loading model: {e}")
 
@@ -217,7 +189,6 @@ with col_right:
             with st.spinner("Thinking…"):
                 reply = chat_once(
                     model=st.session_state.model,
-                    tokenizer=st.session_state.tokenizer,
                     processor=st.session_state.processor,
                     image=image,
                     question=user_q.strip(),
